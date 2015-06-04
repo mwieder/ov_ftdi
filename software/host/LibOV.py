@@ -87,6 +87,15 @@ FTDIEEP_CheckAndProgram.argtypes = [
         ]
 FTDIEEP_CheckAndProgram.restype = ctypes.c_int
 
+# int FTDIEEP_SanityCheck(FTDIDevice *dev, bool verbose)
+FTDIEEP_SanityCheck = libov.FTDIEEP_SanityCheck
+FTDIEEP_SanityCheck.argtypes = [
+        pFTDI_Device,    # dev
+        ctypes.c_bool,   # verbose
+        ]
+FTDIEEP_SanityCheck.restype = ctypes.c_int
+
+
 FTDI_INTERFACE_A = 1
 FTDI_INTERFACE_B = 2
 
@@ -148,12 +157,15 @@ class FTDIDevice:
         # uncomment next lines to use C code to parse packets
         #return FTDIDevice_ReadStream(self._dev, intf, p_cb_StreamCallback(libov.CStreamCallback), 
         #        cb, packetsPerTransfer, numTransfers)
-        
+
     def eeprom_erase(self):
         return FTDIEEP_Erase(self._dev)
 
     def eeprom_program(self, serialno):
         return FTDIEEP_CheckAndProgram(self._dev, serialno)
+
+    def eeprom_sanitycheck(self, verbose=False):
+        return FTDIEEP_SanityCheck(self._dev, verbose)
 
 _FPGA_GetConfigStatus = libov.FPGA_GetConfigStatus
 _FPGA_GetConfigStatus.restype = ctypes.c_int
@@ -176,18 +188,24 @@ class TimeoutError(Exception):
     pass
 
 class _mapped_reg:
-    def __init__(self, readfn, writefn, name, addr):
+    def __init__(self, readfn, writefn, name, addr, size):
         self.readfn = readfn
         self.writefn = writefn
         self.addr = addr
+        self.size = size
         self.shadow = 0
 
     def rd(self):
-        self.shadow = self.readfn(self.addr)
+        self.shadow = 0
+        for i in range(self.size):
+            self.shadow <<= 8
+            self.shadow |= self.readfn(self.addr + i)
         return self.shadow
 
     def wr(self, value):
-        self.shadow = self.writefn(self.addr, value)
+        self.shadow = value
+        for i in range(self.size):
+            self.writefn(self.addr + self.size - 1 - i, (value >> (i * 8)) & 0xFF)
 
 class _mapped_regs:
     def __init__(self, d):
@@ -480,6 +498,66 @@ class RXCSniff:
     def __init__(self):
         self.service = RXCSniff.__RXCSniffService()
 
+
+class SDRAMRead:
+    class __SDRAMReadService(baseService):
+        def getNeededSizeForMagic(self, b):
+            return 2
+
+        def __init__(self, verbose, services):
+            self.__buf = b""
+            self.__services = services
+            self.__verbose = verbose
+
+        def matchMagic(self, byt):
+            return byt == 0xD0
+
+        def getPacketSize(self, buf):
+            return (buf[1] + 1) * 2 + 2
+
+        def consume(self, b):
+            #print("SDRAM", ''.join("%02x"% r for r in b))
+            b = b[2:]
+            if self.__verbose and b:
+                print("SD> %s" % " ".join("%02x" % i for i in b))
+
+            self.__buf += b
+
+            incomplete = False
+
+            while self.__buf and not incomplete:
+                for service in self.__services:
+                    code = service.presentBytes(self.__buf)
+                    if code == INCOMPLETE:
+                        incomplete = True
+                        break
+                    elif code:
+                        self.__buf = self.__buf[code:]
+                        break
+                else:
+                    print("Unmatched byte %02x - discarding" % self.__buf[0])
+                    self.__buf = self.__buf[1:]
+            pass
+        
+    def __init__(self, verbose, services):
+        self.service = SDRAMRead.__SDRAMReadService(verbose, services)
+
+class Dummy:
+    class __DummyService(baseService):
+        def getNeededSizeForMagic(self, b):
+            return 1
+        def __init__(self):
+            pass
+        def matchMagic(self, byt):
+            return byt == 0xE0 or byt == 0xe8
+        def getPacketSize(self, buf):
+            return 3
+        def consume(self, buf):
+            assert ''.join("%02x"% r for r in buf) in ["e0e1e2", "e8e9ea"], buf
+        
+    def __init__(self):
+        self.service = Dummy.__DummyService()
+
 class OVDevice:
     def __init__(self, mapfile=None, verbose=False):
         self.__is_open = False
@@ -494,17 +572,20 @@ class OVDevice:
 
 
         self.regs = self.__build_map(self.__addrmap, self.ioread, self.iowrite)
-        self.ulpiregs = self.__build_map(SMSC_334x_MAP, self.ulpiread, self.ulpiwrite)
+        self.ulpiregs = self.__build_map({x: (y, 1) for x, y in SMSC_334x_MAP.items()}, self.ulpiread, self.ulpiwrite)
 
 
         self.clkup = False
 
 
         self.io = IO()
+
         self.lfsrtest = LFSRTest()
         self.rxcsniff = RXCSniff()
+        self.sdram_read = SDRAMRead(False, [self.rxcsniff.service])
+        self.dummy = Dummy()
 
-        self.__services = [self.io.service, self.lfsrtest.service, self.rxcsniff.service]
+        self.__services = [self.io.service, self.lfsrtest.service, self.rxcsniff.service, self.sdram_read.service, self.dummy.service]
 
         # Inject a write function to the services
         for service in self.__services:
@@ -555,8 +636,8 @@ class OVDevice:
             
     def __build_map(self, addrmap, readfn, writefn):
         d = {}
-        for name, addr in addrmap.items():
-            d[name] = _mapped_reg(readfn, writefn, name, addr)
+        for name, (addr, size) in addrmap.items():
+            d[name] = _mapped_reg(readfn, writefn, name, addr, size)
 
         return _mapped_regs(d)
 
@@ -579,14 +660,19 @@ class OVDevice:
             if not line:
                 continue
 
-            m = re.match('\s*(\w+)\s*=\s*(\w+)\s*', line)
+            m = re.match('\s*(\w+)\s*=\s*(\w+)(:\w+)?\s*', line)
             if not m:
                 raise ValueError("Mapfile - could not parse %s" % line)
 
             name = m.group(1)
             value = int(m.group(2), 16)
+            if m.group(3) is None:
+                size = 1
+            else:
+                size = int(m.group(3)[1:], 16) + 1 - value
+                assert size > 1
 
-            self.__addrmap[name] = value
+            self.__addrmap[name] = value, size
 
 
     def resolve_addr(self, sym):
